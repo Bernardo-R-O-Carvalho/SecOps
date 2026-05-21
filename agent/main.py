@@ -875,9 +875,9 @@ function renderReport(report) {
         </div>`;
     });
 
-  // Download links
-  const md   = report.markdown   || '';
-  const json = report.json_report || '';
+  // Download links — decode base64 encoded content
+  const md   = report.markdown_b64   ? atob(report.markdown_b64)   : '';
+  const json = report.json_report_b64 ? atob(report.json_report_b64) : '';
 
   const mdBlob   = new Blob([md],   { type: 'text/markdown' });
   const jsonBlob = new Blob([json], { type: 'application/json' });
@@ -984,7 +984,12 @@ async def run_pipeline_stream(project_path: str) -> AsyncGenerator[str, None]:
         yield log(f"  Actions: {len(report_obj.remediation)} remediation steps")
         yield event({"type": "phase_done", "phase_num": 5, "message": f"Report {report_obj.report_id} generated"})
 
-        # Emit full report
+        # Emit full report — encode markdown/json as base64 to avoid
+        # JSON serialization issues with special characters and newlines
+        import base64
+        md_b64   = base64.b64encode(md_content.encode("utf-8")).decode("ascii")
+        json_b64 = base64.b64encode(json_content.encode("utf-8")).decode("ascii")
+
         yield event({
             "type": "report",
             "report": {
@@ -997,8 +1002,8 @@ async def run_pipeline_stream(project_path: str) -> AsyncGenerator[str, None]:
                 "timeline":            report_obj.timeline,
                 "top_vulnerabilities": report_obj.top_vulnerabilities,
                 "remediation":         report_obj.remediation,
-                "markdown":            md_content,
-                "json_report":         json_content,
+                "markdown_b64":        md_b64,
+                "json_report_b64":     json_b64,
             }
         })
 
