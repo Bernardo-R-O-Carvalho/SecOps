@@ -791,6 +791,23 @@ async function startScan() {
     log('Error: ' + e.message, 'log-error');
   }
 
+  // After SSE stream ends, fetch the latest report from the server
+  try {
+    const listRes = await fetch('/reports/latest');
+    if (listRes.ok) {
+      const latest = await listRes.json();
+      if (latest.report_id) {
+        const repRes = await fetch('/report/' + latest.report_id);
+        if (repRes.ok) {
+          const report = await repRes.json();
+          renderReport(report);
+        }
+      }
+    }
+  } catch(e) {
+    // No report available yet
+  }
+
   btn.disabled = false;
   btn.innerHTML = '▶ RUN AGENT';
 }
@@ -1039,6 +1056,15 @@ async def scan(request: ScanRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/reports/latest")
+async def get_latest_report():
+    from fastapi.responses import JSONResponse
+    if not _report_store:
+        return JSONResponse({"error": "No reports yet"}, status_code=404)
+    latest_id = sorted(_report_store.keys())[-1]
+    return JSONResponse({"report_id": latest_id})
 
 
 @app.get("/report/{report_id}")
