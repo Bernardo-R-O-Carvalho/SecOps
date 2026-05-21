@@ -816,6 +816,16 @@ function handleEvent(data) {
     case 'report':
       renderReport(data.report);
       break;
+
+    case 'report_b64':
+      // Decode the base64-encoded report payload to avoid SSE JSON issues
+      try {
+        const decoded = JSON.parse(atob(data.payload));
+        renderReport(decoded);
+      } catch(e) {
+        log('Error rendering report: ' + e.message, 'log-error');
+      }
+      break;
   }
 }
 
@@ -984,28 +994,24 @@ async def run_pipeline_stream(project_path: str) -> AsyncGenerator[str, None]:
         yield log(f"  Actions: {len(report_obj.remediation)} remediation steps")
         yield event({"type": "phase_done", "phase_num": 5, "message": f"Report {report_obj.report_id} generated"})
 
-        # Emit full report — encode markdown/json as base64 to avoid
-        # JSON serialization issues with special characters and newlines
-        import base64
-        md_b64   = base64.b64encode(md_content.encode("utf-8")).decode("ascii")
-        json_b64 = base64.b64encode(json_content.encode("utf-8")).decode("ascii")
-
-        yield event({
-            "type": "report",
-            "report": {
-                "report_id":           report_obj.report_id,
-                "generated_at":        report_obj.generated_at,
-                "attack_id":           report_obj.attack_id,
-                "risk_level":          report_obj.risk_level,
-                "risk_score":          report_obj.risk_score,
-                "executive_summary":   report_obj.executive_summary,
-                "timeline":            report_obj.timeline,
-                "top_vulnerabilities": report_obj.top_vulnerabilities,
-                "remediation":         report_obj.remediation,
-                "markdown_b64":        md_b64,
-                "json_report_b64":     json_b64,
-            }
-        })
+        # Emit full report as a single base64-encoded payload to avoid
+        # SSE JSON parse errors caused by special characters in text fields.
+        import base64, json as _json
+        report_payload = {
+            "report_id":           report_obj.report_id,
+            "generated_at":        report_obj.generated_at,
+            "attack_id":           report_obj.attack_id,
+            "risk_level":          report_obj.risk_level,
+            "risk_score":          report_obj.risk_score,
+            "executive_summary":   report_obj.executive_summary,
+            "timeline":            report_obj.timeline,
+            "top_vulnerabilities": report_obj.top_vulnerabilities,
+            "remediation":         report_obj.remediation,
+            "markdown_b64":        base64.b64encode(md_content.encode()).decode(),
+            "json_report_b64":     base64.b64encode(json_content.encode()).decode(),
+        }
+        payload_b64 = base64.b64encode(_json.dumps(report_payload).encode()).decode()
+        yield f"data: {_json.dumps({'type': 'report_b64', 'payload': payload_b64})}\n\n"
 
         yield log("", "log-dim")
         yield log("✓ Pipeline complete.", "log-success")
