@@ -36,6 +36,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# In-memory report store (keyed by report_id)
+_report_store: dict = {}
+
 
 # ─── Request model ────────────────────────────────────────────────────────────
 
@@ -776,8 +779,12 @@ async function startScan() {
       const lines = chunk.split('\\n').filter(l => l.startsWith('data: '));
 
       for (const line of lines) {
-        const data = JSON.parse(line.slice(6));
-        handleEvent(data);
+        try {
+          const data = JSON.parse(line.slice(6));
+          handleEvent(data);
+        } catch(e) {
+          // Skip malformed SSE lines
+        }
       }
     }
   } catch (e) {
@@ -817,14 +824,12 @@ function handleEvent(data) {
       renderReport(data.report);
       break;
 
-    case 'report_b64':
-      // Decode the base64-encoded report payload to avoid SSE JSON issues
-      try {
-        const decoded = JSON.parse(atob(data.payload));
-        renderReport(decoded);
-      } catch(e) {
-        log('Error rendering report: ' + e.message, 'log-error');
-      }
+    case 'report_ready':
+      // Fetch report from server via separate HTTP request (avoids SSE size limits)
+      fetch('/report/' + data.report_id)
+        .then(r => r.json())
+        .then(report => renderReport(report))
+        .catch(e => log('Error loading report: ' + e.message, 'log-error'));
       break;
   }
 }
@@ -886,8 +891,8 @@ function renderReport(report) {
     });
 
   // Download links — decode base64 encoded content
-  const md   = report.markdown_b64   ? atob(report.markdown_b64)   : '';
-  const json = report.json_report_b64 ? atob(report.json_report_b64) : '';
+  const md   = report.markdown_b64 ? atob(report.markdown_b64) : '';
+  const json = report.json_b64     ? atob(report.json_b64)     : '';
 
   const mdBlob   = new Blob([md],   { type: 'text/markdown' });
   const jsonBlob = new Blob([json], { type: 'application/json' });
@@ -913,7 +918,7 @@ async def run_pipeline_stream(project_path: str) -> AsyncGenerator[str, None]:
     """
 
     def event(data: dict) -> str:
-        return f"data: {json.dumps(data)}\n\n"
+        return f"data: {json.dumps(data, ensure_ascii=True)}\n\n"
 
     def log(msg: str, cls: str = "log-info"):
         return event({"type": "log", "message": msg, "cls": cls})
@@ -994,10 +999,11 @@ async def run_pipeline_stream(project_path: str) -> AsyncGenerator[str, None]:
         yield log(f"  Actions: {len(report_obj.remediation)} remediation steps")
         yield event({"type": "phase_done", "phase_num": 5, "message": f"Report {report_obj.report_id} generated"})
 
-        # Emit full report as a single base64-encoded payload to avoid
-        # SSE JSON parse errors caused by special characters in text fields.
-        import base64, json as _json
-        report_payload = {
+        # Store report in memory and notify frontend with just the ID.
+        # The frontend fetches the full report via GET /report/{report_id}.
+        # This avoids SSE JSON parse errors caused by large payloads.
+        import base64
+        _report_store[report_obj.report_id] = {
             "report_id":           report_obj.report_id,
             "generated_at":        report_obj.generated_at,
             "attack_id":           report_obj.attack_id,
@@ -1008,10 +1014,9 @@ async def run_pipeline_stream(project_path: str) -> AsyncGenerator[str, None]:
             "top_vulnerabilities": report_obj.top_vulnerabilities,
             "remediation":         report_obj.remediation,
             "markdown_b64":        base64.b64encode(md_content.encode()).decode(),
-            "json_report_b64":     base64.b64encode(json_content.encode()).decode(),
+            "json_b64":            base64.b64encode(json_content.encode()).decode(),
         }
-        payload_b64 = base64.b64encode(_json.dumps(report_payload).encode()).decode()
-        yield f"data: {_json.dumps({'type': 'report_b64', 'payload': payload_b64})}\n\n"
+        yield f'data: {{"type": "report_ready", "report_id": "{report_obj.report_id}"}}\n\n'
 
         yield log("", "log-dim")
         yield log("✓ Pipeline complete.", "log-success")
@@ -1034,6 +1039,15 @@ async def scan(request: ScanRequest):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@app.get("/report/{report_id}")
+async def get_report(report_id: str):
+    from fastapi.responses import JSONResponse
+    report = _report_store.get(report_id)
+    if not report:
+        return JSONResponse({"error": "Report not found"}, status_code=404)
+    return JSONResponse(report)
 
 
 @app.get("/health")
