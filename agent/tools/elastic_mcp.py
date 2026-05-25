@@ -92,11 +92,6 @@ class KillChain:
 # ─── Elasticsearch client ─────────────────────────────────────────────────────
 
 class ElasticClient:
-    """
-    Thin wrapper around the Elasticsearch REST API.
-    Authenticates via API key header.
-    """
-
     def __init__(self, url: str, api_key: str):
         self.url     = url.rstrip("/")
         self.headers = {
@@ -116,11 +111,9 @@ class ElasticClient:
         return response.json()
 
     def index(self, index: str, document: dict) -> dict:
-        """Index a single document."""
         return self._request("POST", f"{index}/_doc", document)
 
     def bulk_index(self, index: str, documents: list[dict]) -> dict:
-        """Bulk index multiple documents for efficiency."""
         lines = []
         for doc in documents:
             lines.append(json.dumps({"index": {"_index": index}}))
@@ -138,20 +131,17 @@ class ElasticClient:
         return response.json()
 
     def search(self, index: str, query: dict) -> dict:
-        """Execute a search query."""
         return self._request("GET", f"{index}/_search", query)
 
     def create_index(self, index: str, mappings: dict) -> dict:
-        """Create index with mappings (ignores error if already exists)."""
         try:
             return self._request("PUT", index, mappings)
         except httpx.HTTPStatusError as e:
-            if e.response.status_code == 400:  # already exists
+            if e.response.status_code == 400:
                 return {"acknowledged": True, "existing": True}
             raise
 
     def count(self, index: str) -> int:
-        """Return document count for an index."""
         try:
             result = self._request("GET", f"{index}/_count")
             return result.get("count", 0)
@@ -162,8 +152,6 @@ class ElasticClient:
 # ─── Index setup ──────────────────────────────────────────────────────────────
 
 def setup_indices(client: ElasticClient) -> None:
-    """Creates the three SecOps indices with proper mappings."""
-
     base_mapping = {
         "mappings": {
             "properties": {
@@ -188,27 +176,15 @@ def setup_indices(client: ElasticClient) -> None:
 # ─── Log simulation ───────────────────────────────────────────────────────────
 
 def generate_attack_logs(findings: list[dict]) -> list[AttackEvent]:
-    """
-    Generates realistic attack logs based on vulnerabilities found in Phase 2.
-
-    Each vulnerability type maps to a specific MITRE ATT&CK technique:
-    - AWS key exposed      → Credential Access (T1552) + Cloud exploitation
-    - MongoDB URI          → Initial Access via valid accounts (T1078)
-    - CVE in dependency    → Exploitation for initial access (T1190)
-    - Command injection    → Execution (T1059)
-    - CI/CD misconfiguration → Supply chain compromise (T1195)
-    """
-
     attacker_ips = [
-        "185.220.101.47",  # known Tor exit node
-        "194.165.16.11",   # known scanning IP
-        "45.142.212.100",  # known threat actor range
+        "185.220.101.47",
+        "194.165.16.11",
+        "45.142.212.100",
     ]
 
     now    = datetime.now(timezone.utc)
     events = []
 
-    # Filter findings by type for targeted log generation
     secrets   = [f for f in findings if f["type"] == "SECRET_EXPOSED"]
     cves      = [f for f in findings if f["type"] == "VULNERABLE_DEPENDENCY"]
     misconfig = [f for f in findings if f["type"] == "MISCONFIGURATION"]
@@ -226,7 +202,7 @@ def generate_attack_logs(findings: list[dict]) -> list[AttackEvent]:
         description = "Automated scanner discovered public repository with sensitive files",
     ))
 
-    # ── Stage 2: Credential Access (from exposed secrets) ────────────────────
+    # ── Stage 2: Credential Access ────────────────────────────────────────────
     aws_secrets = [s for s in secrets if "AWS" in s.get("description", "")]
     if aws_secrets:
         events.append(AttackEvent(
@@ -239,10 +215,8 @@ def generate_attack_logs(findings: list[dict]) -> list[AttackEvent]:
             outcome     = "success",
             severity    = "CRITICAL",
             description = "AWS credentials extracted from hardcoded secrets in repository",
-            related_cve = None,
         ))
 
-        # ── Stage 3: Cloud exploitation using stolen AWS key ──────────────────
         events.append(AttackEvent(
             timestamp   = (now - timedelta(hours=5)).isoformat(),
             stage       = "Initial Access",
@@ -348,7 +322,6 @@ def generate_attack_logs(findings: list[dict]) -> list[AttackEvent]:
 # ─── Detection queries ────────────────────────────────────────────────────────
 
 def detect_brute_force(client: ElasticClient) -> list[dict]:
-    """Detects brute force patterns: multiple failures from same IP."""
     query = {
         "query": {
             "bool": {
@@ -366,20 +339,15 @@ def detect_brute_force(client: ElasticClient) -> list[dict]:
         },
         "size": 0
     }
-
     try:
         result  = client.search(EVENTS_INDEX, query)
         buckets = result.get("aggregations", {}).get("by_ip", {}).get("buckets", [])
-        return [
-            {"ip": b["key"], "attempts": b["doc_count"]}
-            for b in buckets if b["doc_count"] >= 3
-        ]
+        return [{"ip": b["key"], "attempts": b["doc_count"]} for b in buckets if b["doc_count"] >= 3]
     except Exception:
         return []
 
 
 def detect_lateral_movement(client: ElasticClient) -> list[dict]:
-    """Detects lateral movement: successful connections to internal systems."""
     query = {
         "query": {
             "bool": {
@@ -392,7 +360,6 @@ def detect_lateral_movement(client: ElasticClient) -> list[dict]:
         },
         "size": 20
     }
-
     try:
         result = client.search(EVENTS_INDEX, query)
         hits   = result.get("hits", {}).get("hits", [])
@@ -402,7 +369,6 @@ def detect_lateral_movement(client: ElasticClient) -> list[dict]:
 
 
 def detect_exfiltration(client: ElasticClient) -> list[dict]:
-    """Detects data exfiltration: outbound connections in exfiltration stage."""
     query = {
         "query": {
             "bool": {
@@ -415,7 +381,6 @@ def detect_exfiltration(client: ElasticClient) -> list[dict]:
         },
         "size": 10
     }
-
     try:
         result = client.search(EVENTS_INDEX, query)
         hits   = result.get("hits", {}).get("hits", [])
@@ -424,19 +389,63 @@ def detect_exfiltration(client: ElasticClient) -> list[dict]:
         return []
 
 
+# ─── Risk scoring ─────────────────────────────────────────────────────────────
+
+def calculate_risk_score(findings: list[dict], kill_chain: "KillChain") -> int:
+    """
+    Continuous risk score 0-100 based on real findings + kill chain coverage.
+
+    Components:
+    - 60 pts: findings weight (severity × quantity, capped)
+    - 40 pts: MITRE ATT&CK stages covered (proportional)
+    """
+    # Component 1: findings severity weight (max 60)
+    weights = {"CRITICAL": 8, "HIGH": 4, "MEDIUM": 2, "LOW": 1}
+    raw_findings = sum(weights.get(f.get("severity", "LOW"), 1) for f in findings)
+    findings_score = min(raw_findings, 60)
+
+    # Component 2: kill chain stage coverage (max 40)
+    max_stages   = 8  # total mapped MITRE stages
+    stages_hit   = len(set(e.stage for e in kill_chain.stages))
+    chain_score  = int((stages_hit / max_stages) * 40)
+
+    return findings_score + chain_score
+
+
+def score_to_level(score: int) -> str:
+    if score >= 75:
+        return "CRITICAL"
+    elif score >= 50:
+        return "HIGH"
+    elif score >= 25:
+        return "MEDIUM"
+    return "LOW"
+
+
 # ─── Kill chain builder ───────────────────────────────────────────────────────
 
-def build_kill_chain(events: list[AttackEvent], project: str) -> KillChain:
+def build_kill_chain(
+    events: list[AttackEvent],
+    project: str,
+    findings: list[dict],
+) -> KillChain:
     """
     Assembles the kill chain from detected events.
-    Risk score is calculated based on stage severity and MITRE technique coverage.
+    Risk score uses continuous formula based on real findings + stage coverage.
     """
+    stages_covered = list(dict.fromkeys(e.stage for e in events))
 
-    severity_scores = {"CRITICAL": 25, "HIGH": 15, "MEDIUM": 8, "LOW": 3}
-    risk_score      = sum(severity_scores.get(e.severity, 0) for e in events)
-    risk_score      = min(risk_score, 100)
+    # Build a temporary KillChain to pass to calculate_risk_score
+    temp_chain = KillChain(
+        attack_id      = "",
+        target_project = project,
+        started_at     = events[0].timestamp if events else datetime.now(timezone.utc).isoformat(),
+        stages         = events,
+        risk_score     = 0,
+        summary        = "",
+    )
 
-    stages_covered  = list(dict.fromkeys(e.stage for e in events))  # ordered unique
+    risk_score = calculate_risk_score(findings, temp_chain)
 
     summary = (
         f"Full attack chain detected across {len(stages_covered)} MITRE ATT&CK stages: "
@@ -459,23 +468,19 @@ def build_kill_chain(events: list[AttackEvent], project: str) -> KillChain:
 # ─── Risk dashboard ───────────────────────────────────────────────────────────
 
 def build_risk_dashboard(findings: list[dict], kill_chain: KillChain) -> dict:
-    """Builds a structured risk dashboard combining findings and attack events."""
-
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0}
     for f in findings:
         sev = f.get("severity", "LOW")
         severity_counts[sev] = severity_counts.get(sev, 0) + 1
 
     attack_stages = list(dict.fromkeys(e.stage for e in kill_chain.stages))
+    risk_score    = kill_chain.risk_score
 
     return {
         "generated_at":    datetime.now(timezone.utc).isoformat(),
         "target_project":  kill_chain.target_project,
-        "risk_score":      kill_chain.risk_score,
-        "risk_level":      "CRITICAL" if kill_chain.risk_score >= 75
-                           else "HIGH" if kill_chain.risk_score >= 50
-                           else "MEDIUM" if kill_chain.risk_score >= 25
-                           else "LOW",
+        "risk_score":      risk_score,
+        "risk_level":      score_to_level(risk_score),
         "findings_summary": {
             "total":       len(findings),
             "by_severity": severity_counts,
@@ -502,24 +507,11 @@ def build_risk_dashboard(findings: list[dict], kill_chain: KillChain) -> dict:
 # ─── Main orchestrator ────────────────────────────────────────────────────────
 
 def run_elastic_pipeline(scan_summary: dict) -> dict:
-    """
-    Main entry point for Phase 3.
-
-    Receives the ScanResult summary from gitlab_mcp.py and:
-    1. Sets up Elasticsearch indices
-    2. Ingests vulnerability findings
-    3. Generates and ingests simulated attack logs
-    4. Runs detection queries
-    5. Builds and returns the kill chain + risk dashboard
-    """
-
     url     = ELASTIC_URL     or os.getenv("ELASTIC_URL")
     api_key = ELASTIC_API_KEY or os.getenv("ELASTIC_API_KEY")
 
     if not url or not api_key:
-        raise ValueError(
-            "ELASTIC_URL and ELASTIC_API_KEY must be set as environment variables."
-        )
+        raise ValueError("ELASTIC_URL and ELASTIC_API_KEY must be set as environment variables.")
 
     client   = ElasticClient(url, api_key)
     findings = scan_summary.get("findings", [])
@@ -528,42 +520,34 @@ def run_elastic_pipeline(scan_summary: dict) -> dict:
     print(f"\n⚡ Starting Elastic pipeline for project: {project}")
     print(f"   Findings received from Phase 2: {len(findings)}")
 
-    # ── Step 1: Setup indices ─────────────────────────────────────────────────
     print("\n📦 Setting up Elasticsearch indices...")
     setup_indices(client)
 
-    # ── Step 2: Ingest vulnerability findings ─────────────────────────────────
     print(f"\n📥 Ingesting {len(findings)} vulnerability findings...")
     finding_docs = [
-        {
-            "@timestamp": datetime.now(timezone.utc).isoformat(),
-            "source":     "gitlab_scanner",
-            "project":    project,
-            **f,
-        }
+        {"@timestamp": datetime.now(timezone.utc).isoformat(), "source": "gitlab_scanner", "project": project, **f}
         for f in findings
     ]
     if finding_docs:
         client.bulk_index(FINDINGS_INDEX, finding_docs)
         print(f"   ✅ {len(finding_docs)} findings indexed in {FINDINGS_INDEX}")
 
-    # ── Step 3: Generate and ingest attack logs ───────────────────────────────
     print("\n🎭 Generating attack scenario based on discovered vulnerabilities...")
     attack_events = generate_attack_logs(findings)
     print(f"   Generated {len(attack_events)} attack events across MITRE ATT&CK stages")
 
     event_docs = [
         {
-            "@timestamp": e.timestamp,
-            "stage":      e.stage,
-            "technique":  e.technique,
-            "source_ip":  e.source_ip,
-            "destination":e.destination,
-            "action":     e.action,
-            "outcome":    e.outcome,
-            "severity":   e.severity,
-            "description":e.description,
-            "related_cve":e.related_cve,
+            "@timestamp":  e.timestamp,
+            "stage":       e.stage,
+            "technique":   e.technique,
+            "source_ip":   e.source_ip,
+            "destination": e.destination,
+            "action":      e.action,
+            "outcome":     e.outcome,
+            "severity":    e.severity,
+            "description": e.description,
+            "related_cve": e.related_cve,
         }
         for e in attack_events
     ]
@@ -571,7 +555,6 @@ def run_elastic_pipeline(scan_summary: dict) -> dict:
         client.bulk_index(EVENTS_INDEX, event_docs)
         print(f"   ✅ {len(event_docs)} attack events indexed in {EVENTS_INDEX}")
 
-    # ── Step 4: Run detection queries ─────────────────────────────────────────
     print("\n🔎 Running threat detection queries...")
     brute_force      = detect_brute_force(client)
     lateral_movement = detect_lateral_movement(client)
@@ -581,27 +564,24 @@ def run_elastic_pipeline(scan_summary: dict) -> dict:
     print(f"   Lateral movement events:        {len(lateral_movement)}")
     print(f"   Exfiltration events:            {len(exfiltration)}")
 
-    # ── Step 5: Build kill chain ──────────────────────────────────────────────
     print("\n⛓️  Building kill chain...")
-    kill_chain = build_kill_chain(attack_events, project)
+    kill_chain = build_kill_chain(attack_events, project, findings)
     print(f"   Attack ID:   {kill_chain.attack_id}")
     print(f"   Risk Score:  {kill_chain.risk_score}/100")
     print(f"   Stages:      {' → '.join(list(dict.fromkeys(e.stage for e in kill_chain.stages)))}")
 
-    # Index the kill chain as an alert
     client.index(ALERTS_INDEX, {
         "@timestamp": datetime.now(timezone.utc).isoformat(),
         "type":       "kill_chain",
         **kill_chain.to_dict(),
     })
 
-    # ── Step 6: Build risk dashboard ──────────────────────────────────────────
     dashboard = build_risk_dashboard(findings, kill_chain)
 
     print("\n✅ Elastic pipeline complete")
     return {
-        "kill_chain":      kill_chain.to_dict(),
-        "risk_dashboard":  dashboard,
+        "kill_chain":     kill_chain.to_dict(),
+        "risk_dashboard": dashboard,
         "detections": {
             "brute_force":      brute_force,
             "lateral_movement": lateral_movement,
@@ -615,7 +595,6 @@ def run_elastic_pipeline(scan_summary: dict) -> dict:
 if __name__ == "__main__":
     import sys
 
-    # Load findings from gitlab_mcp.py output (JSON file or stdin)
     if len(sys.argv) > 1:
         with open(sys.argv[1], "r") as f:
             scan_summary = json.load(f)
@@ -623,7 +602,6 @@ if __name__ == "__main__":
         print("Usage: python elastic_mcp.py <gitlab_scan_output.json>")
         print("\nRunning with built-in demo findings for testing...")
 
-        # Built-in demo findings (mirrors what gitlab_mcp.py would output)
         scan_summary = {
             "project": "secops-demo/vulnerable-app",
             "total": 30,
